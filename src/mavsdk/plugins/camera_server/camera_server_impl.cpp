@@ -19,6 +19,12 @@ CameraServerImpl::~CameraServerImpl()
 void CameraServerImpl::init()
 {
     _server_component_impl->register_mavlink_command_handler(
+        MAV_CMD_REQUEST_MESSAGE,
+        [this](const MavlinkCommandReceiver::CommandLong& command) {
+            return process_camera_request(command);
+        },
+        this);
+    _server_component_impl->register_mavlink_command_handler(
         MAV_CMD_REQUEST_CAMERA_INFORMATION,
         [this](const MavlinkCommandReceiver::CommandLong& command) {
             return process_camera_information_request(command);
@@ -880,6 +886,39 @@ void CameraServerImpl::stop_image_capture_interval()
     _image_capture_timer_interval_s = 0;
 }
 
+std::optional<mavlink_command_ack_t> CameraServerImpl::process_camera_request(
+    const MavlinkCommandReceiver::CommandLong& command)
+{
+    LogWarn() << "Camera request";
+    auto message_id = static_cast<uint32_t>(command.params.param1);
+
+    switch (message_id) {
+    case MAVLINK_MSG_ID_CAMERA_INFORMATION: {
+        return process_camera_information(command);
+    }
+    case MAVLINK_MSG_ID_CAMERA_SETTINGS: {
+        return process_camera_settings(command);
+    }
+    case MAVLINK_MSG_ID_VIDEO_STREAM_INFORMATION: {
+        auto stream_id = static_cast<uint8_t>(command.params.param2);
+        return process_video_stream_information(command, stream_id);
+    }
+    case MAVLINK_MSG_ID_VIDEO_STREAM_STATUS: {
+        auto stream_id = static_cast<uint8_t>(command.params.param2);
+        return process_video_stream_status(command, stream_id);
+    }
+    case MAVLINK_MSG_ID_STORAGE_INFORMATION: {
+        auto storage_id = static_cast<uint8_t>(command.params.param2);
+        return process_storage_information(command, storage_id);
+    }
+    default:
+        break;
+    }
+
+    return _server_component_impl->make_command_ack_message(
+                command, MAV_RESULT::MAV_RESULT_UNSUPPORTED);
+}
+
 std::optional<mavlink_command_ack_t> CameraServerImpl::process_camera_information_request(
     const MavlinkCommandReceiver::CommandLong& command)
 {
@@ -892,99 +931,7 @@ std::optional<mavlink_command_ack_t> CameraServerImpl::process_camera_informatio
             command, MAV_RESULT::MAV_RESULT_ACCEPTED);
     }
 
-    if (!_is_information_set) {
-        return _server_component_impl->make_command_ack_message(
-            command, MAV_RESULT::MAV_RESULT_TEMPORARILY_REJECTED);
-    }
-
-    // ack needs to be sent before camera information message
-    auto command_ack =
-        _server_component_impl->make_command_ack_message(command, MAV_RESULT::MAV_RESULT_ACCEPTED);
-    _server_component_impl->send_command_ack(command_ack);
-    LogDebug() << "sent info ack";
-
-    // It is safe to ignore the return value of parse_version_string() here
-    // since the string was already validated in set_information().
-    uint32_t firmware_version;
-    parse_version_string(_information.firmware_version, firmware_version);
-
-    // build capability from camera server information.camera_cap_flags
-    uint32_t capability_flags{};
-    for (auto capability_flag : _information.camera_cap_flags) {
-        switch (capability_flag) {
-            case CameraServer::Information::CameraCapFlags::CaptureVideo:
-                capability_flags |= CAMERA_CAP_FLAGS::CAMERA_CAP_FLAGS_CAPTURE_VIDEO;
-                break;
-            case CameraServer::Information::CameraCapFlags::CaptureImage:
-                capability_flags |= CAMERA_CAP_FLAGS::CAMERA_CAP_FLAGS_CAPTURE_IMAGE;
-                break;
-            case CameraServer::Information::CameraCapFlags::HasModes:
-                capability_flags |= CAMERA_CAP_FLAGS::CAMERA_CAP_FLAGS_HAS_MODES;
-                break;
-            case CameraServer::Information::CameraCapFlags::CanCaptureImageInVideoMode:
-                capability_flags |=
-                    CAMERA_CAP_FLAGS::CAMERA_CAP_FLAGS_CAN_CAPTURE_IMAGE_IN_VIDEO_MODE;
-                break;
-            case CameraServer::Information::CameraCapFlags::CanCaptureVideoInImageMode:
-                capability_flags |=
-                    CAMERA_CAP_FLAGS::CAMERA_CAP_FLAGS_CAN_CAPTURE_VIDEO_IN_IMAGE_MODE;
-                break;
-            case CameraServer::Information::CameraCapFlags::HasImageSurveyMode:
-                capability_flags |= CAMERA_CAP_FLAGS::CAMERA_CAP_FLAGS_HAS_IMAGE_SURVEY_MODE;
-                break;
-            case CameraServer::Information::CameraCapFlags::HasBasicZoom:
-                capability_flags |= CAMERA_CAP_FLAGS::CAMERA_CAP_FLAGS_HAS_BASIC_ZOOM;
-                break;
-            case CameraServer::Information::CameraCapFlags::HasBasicFocus:
-                capability_flags |= CAMERA_CAP_FLAGS::CAMERA_CAP_FLAGS_HAS_BASIC_FOCUS;
-                break;
-            case CameraServer::Information::CameraCapFlags::HasVideoStream:
-                capability_flags |= CAMERA_CAP_FLAGS::CAMERA_CAP_FLAGS_HAS_VIDEO_STREAM;
-                break;
-            case CameraServer::Information::CameraCapFlags::HasTrackingPoint:
-                capability_flags |= CAMERA_CAP_FLAGS::CAMERA_CAP_FLAGS_HAS_TRACKING_POINT;
-                break;
-            case CameraServer::Information::CameraCapFlags::HasTrackingRectangle:
-                capability_flags |= CAMERA_CAP_FLAGS::CAMERA_CAP_FLAGS_HAS_TRACKING_RECTANGLE;
-                break;
-            case CameraServer::Information::CameraCapFlags::HasTrackingGeoStatus:
-                capability_flags |= CAMERA_CAP_FLAGS::CAMERA_CAP_FLAGS_HAS_TRACKING_GEO_STATUS;
-                break;
-        }
-    }
-
-    _information.vendor_name.resize(sizeof(mavlink_camera_information_t::vendor_name));
-    _information.model_name.resize(sizeof(mavlink_camera_information_t::model_name));
-    _information.definition_file_uri.resize(
-        sizeof(mavlink_camera_information_t::cam_definition_uri));
-
-    _server_component_impl->queue_message([&](MavlinkAddress mavlink_address, uint8_t channel) {
-        mavlink_message_t message{};
-        mavlink_msg_camera_information_pack_chan(
-            mavlink_address.system_id,
-            mavlink_address.component_id,
-            channel,
-            &message,
-            static_cast<uint32_t>(_server_component_impl->get_time().elapsed_s() * 1e3),
-            reinterpret_cast<const uint8_t*>(_information.vendor_name.c_str()),
-            reinterpret_cast<const uint8_t*>(_information.model_name.c_str()),
-            firmware_version,
-            _information.focal_length_mm,
-            _information.horizontal_sensor_size_mm,
-            _information.vertical_sensor_size_mm,
-            _information.horizontal_resolution_px,
-            _information.vertical_resolution_px,
-            _information.lens_id,
-            capability_flags,
-            _information.definition_file_version,
-            _information.definition_file_uri.c_str(),
-            0);
-        return message;
-    });
-    LogDebug() << "sent info msg";
-
-    // ack was already sent
-    return std::nullopt;
+    return process_camera_information(command);
 }
 
 std::optional<mavlink_command_ack_t> CameraServerImpl::process_camera_settings_request(
@@ -998,21 +945,7 @@ std::optional<mavlink_command_ack_t> CameraServerImpl::process_camera_settings_r
             command, MAV_RESULT::MAV_RESULT_ACCEPTED);
     }
 
-    if (_settings_callbacks.empty()) {
-        LogDebug() << "camera settings with no settings subscriber";
-        return _server_component_impl->make_command_ack_message(
-            command, MAV_RESULT::MAV_RESULT_UNSUPPORTED);
-    }
-
-    // ack needs to be sent before storage information message
-    auto command_ack =
-        _server_component_impl->make_command_ack_message(command, MAV_RESULT::MAV_RESULT_ACCEPTED);
-    _server_component_impl->send_command_ack(command_ack);
-
-    _settings_callbacks(0);
-
-    // result will send in respond_settings
-    return std::nullopt;
+    return process_camera_settings(command);
 }
 
 std::optional<mavlink_command_ack_t> CameraServerImpl::process_storage_information_request(
@@ -1027,26 +960,7 @@ std::optional<mavlink_command_ack_t> CameraServerImpl::process_storage_informati
             command, MAV_RESULT::MAV_RESULT_ACCEPTED);
     }
 
-    if (_storage_information_callbacks.empty()) {
-        LogDebug()
-            << "Get storage information requested with no set storage information subscriber";
-        return _server_component_impl->make_command_ack_message(
-            command, MAV_RESULT::MAV_RESULT_UNSUPPORTED);
-    }
-
-    // ack needs to be sent before storage information message
-    auto command_ack =
-        _server_component_impl->make_command_ack_message(command, MAV_RESULT::MAV_RESULT_ACCEPTED);
-    _server_component_impl->send_command_ack(command_ack);
-
-    // TODO may need support multi storage id
-    _last_storage_id = storage_id;
-
-    _last_storage_information_command = command;
-    _storage_information_callbacks(storage_id);
-
-    // result will send in respond_storage_information
-    return std::nullopt;
+    return process_storage_information(command, storage_id);
 }
 
 std::optional<mavlink_command_ack_t>
@@ -1440,7 +1354,170 @@ std::optional<mavlink_command_ack_t> CameraServerImpl::process_video_stream_info
 {
     auto stream_id = static_cast<uint8_t>(command.params.param1);
 
-    UNUSED(stream_id);
+    return process_video_stream_information(command, stream_id);
+}
+
+std::optional<mavlink_command_ack_t> CameraServerImpl::process_video_stream_status_request(
+    const MavlinkCommandReceiver::CommandLong& command)
+{
+    auto stream_id = static_cast<uint8_t>(command.params.param1);
+
+    return process_video_stream_status(command, stream_id);
+}
+
+std::optional<mavlink_command_ack_t> CameraServerImpl::process_camera_information(
+    const MavlinkCommandReceiver::CommandLong& command)
+{
+    LogWarn() << "Camera information request";
+
+    if (!_is_information_set) {
+        return _server_component_impl->make_command_ack_message(
+            command, MAV_RESULT::MAV_RESULT_TEMPORARILY_REJECTED);
+    }
+
+    // ack needs to be sent before camera information message
+    auto command_ack =
+        _server_component_impl->make_command_ack_message(command, MAV_RESULT::MAV_RESULT_ACCEPTED);
+    _server_component_impl->send_command_ack(command_ack);
+    LogDebug() << "sent info ack";
+
+    // It is safe to ignore the return value of parse_version_string() here
+    // since the string was already validated in set_information().
+    uint32_t firmware_version;
+    parse_version_string(_information.firmware_version, firmware_version);
+
+    // build capability from camera server information.camera_cap_flags
+    uint32_t capability_flags{};
+    for (auto capability_flag : _information.camera_cap_flags) {
+        switch (capability_flag) {
+            case CameraServer::Information::CameraCapFlags::CaptureVideo:
+                capability_flags |= CAMERA_CAP_FLAGS::CAMERA_CAP_FLAGS_CAPTURE_VIDEO;
+                break;
+            case CameraServer::Information::CameraCapFlags::CaptureImage:
+                capability_flags |= CAMERA_CAP_FLAGS::CAMERA_CAP_FLAGS_CAPTURE_IMAGE;
+                break;
+            case CameraServer::Information::CameraCapFlags::HasModes:
+                capability_flags |= CAMERA_CAP_FLAGS::CAMERA_CAP_FLAGS_HAS_MODES;
+                break;
+            case CameraServer::Information::CameraCapFlags::CanCaptureImageInVideoMode:
+                capability_flags |=
+                    CAMERA_CAP_FLAGS::CAMERA_CAP_FLAGS_CAN_CAPTURE_IMAGE_IN_VIDEO_MODE;
+                break;
+            case CameraServer::Information::CameraCapFlags::CanCaptureVideoInImageMode:
+                capability_flags |=
+                    CAMERA_CAP_FLAGS::CAMERA_CAP_FLAGS_CAN_CAPTURE_VIDEO_IN_IMAGE_MODE;
+                break;
+            case CameraServer::Information::CameraCapFlags::HasImageSurveyMode:
+                capability_flags |= CAMERA_CAP_FLAGS::CAMERA_CAP_FLAGS_HAS_IMAGE_SURVEY_MODE;
+                break;
+            case CameraServer::Information::CameraCapFlags::HasBasicZoom:
+                capability_flags |= CAMERA_CAP_FLAGS::CAMERA_CAP_FLAGS_HAS_BASIC_ZOOM;
+                break;
+            case CameraServer::Information::CameraCapFlags::HasBasicFocus:
+                capability_flags |= CAMERA_CAP_FLAGS::CAMERA_CAP_FLAGS_HAS_BASIC_FOCUS;
+                break;
+            case CameraServer::Information::CameraCapFlags::HasVideoStream:
+                capability_flags |= CAMERA_CAP_FLAGS::CAMERA_CAP_FLAGS_HAS_VIDEO_STREAM;
+                break;
+            case CameraServer::Information::CameraCapFlags::HasTrackingPoint:
+                capability_flags |= CAMERA_CAP_FLAGS::CAMERA_CAP_FLAGS_HAS_TRACKING_POINT;
+                break;
+            case CameraServer::Information::CameraCapFlags::HasTrackingRectangle:
+                capability_flags |= CAMERA_CAP_FLAGS::CAMERA_CAP_FLAGS_HAS_TRACKING_RECTANGLE;
+                break;
+            case CameraServer::Information::CameraCapFlags::HasTrackingGeoStatus:
+                capability_flags |= CAMERA_CAP_FLAGS::CAMERA_CAP_FLAGS_HAS_TRACKING_GEO_STATUS;
+                break;
+        }
+    }
+
+    _information.vendor_name.resize(sizeof(mavlink_camera_information_t::vendor_name));
+    _information.model_name.resize(sizeof(mavlink_camera_information_t::model_name));
+    _information.definition_file_uri.resize(
+        sizeof(mavlink_camera_information_t::cam_definition_uri));
+
+    _server_component_impl->queue_message([&](MavlinkAddress mavlink_address, uint8_t channel) {
+        mavlink_message_t message{};
+        mavlink_msg_camera_information_pack_chan(
+            mavlink_address.system_id,
+            mavlink_address.component_id,
+            channel,
+            &message,
+            static_cast<uint32_t>(_server_component_impl->get_time().elapsed_s() * 1e3),
+            reinterpret_cast<const uint8_t*>(_information.vendor_name.c_str()),
+            reinterpret_cast<const uint8_t*>(_information.model_name.c_str()),
+            firmware_version,
+            _information.focal_length_mm,
+            _information.horizontal_sensor_size_mm,
+            _information.vertical_sensor_size_mm,
+            _information.horizontal_resolution_px,
+            _information.vertical_resolution_px,
+            _information.lens_id,
+            capability_flags,
+            _information.definition_file_version,
+            _information.definition_file_uri.c_str(),
+            0);
+        return message;
+    });
+    LogDebug() << "sent info msg";
+
+    // ack was already sent
+    return std::nullopt;
+}
+
+std::optional<mavlink_command_ack_t> CameraServerImpl::process_camera_settings(
+    const MavlinkCommandReceiver::CommandLong& command)
+{
+    LogWarn() << "Camera settings request";
+
+    if (_settings_callbacks.empty()) {
+        LogDebug() << "camera settings with no settings subscriber";
+        return _server_component_impl->make_command_ack_message(
+            command, MAV_RESULT::MAV_RESULT_UNSUPPORTED);
+    }
+
+    // ack needs to be sent before storage information message
+    auto command_ack =
+        _server_component_impl->make_command_ack_message(command, MAV_RESULT::MAV_RESULT_ACCEPTED);
+    _server_component_impl->send_command_ack(command_ack);
+
+    _settings_callbacks(0);
+
+    // result will send in respond_settings
+    return std::nullopt;
+}
+
+std::optional<mavlink_command_ack_t> CameraServerImpl::process_storage_information(
+    const MavlinkCommandReceiver::CommandLong& command, uint8_t storage_id)
+{
+    LogWarn() << "Camera storage information request for ID: " << storage_id;
+
+    if (_storage_information_callbacks.empty()) {
+        LogDebug()
+            << "Get storage information requested with no set storage information subscriber";
+        return _server_component_impl->make_command_ack_message(
+            command, MAV_RESULT::MAV_RESULT_UNSUPPORTED);
+    }
+
+    // ack needs to be sent before storage information message
+    auto command_ack =
+        _server_component_impl->make_command_ack_message(command, MAV_RESULT::MAV_RESULT_ACCEPTED);
+    _server_component_impl->send_command_ack(command_ack);
+
+    // TODO may need support multi storage id
+    _last_storage_id = storage_id;
+
+    _last_storage_information_command = command;
+    _storage_information_callbacks(storage_id);
+
+    // result will send in respond_storage_information
+    return std::nullopt;
+}
+
+std::optional<mavlink_command_ack_t> CameraServerImpl::process_video_stream_information(
+    const MavlinkCommandReceiver::CommandLong& command, uint8_t stream_id)
+{
+    LogWarn() << "Camera video stream information request for ID: " << stream_id;
 
     if (!_is_video_stream_info_set) {
         return _server_component_impl->make_command_ack_message(
@@ -1489,18 +1566,15 @@ std::optional<mavlink_command_ack_t> CameraServerImpl::process_video_stream_info
     return std::nullopt;
 }
 
-std::optional<mavlink_command_ack_t> CameraServerImpl::process_video_stream_status_request(
-    const MavlinkCommandReceiver::CommandLong& command)
+std::optional<mavlink_command_ack_t> CameraServerImpl::process_video_stream_status(
+    const MavlinkCommandReceiver::CommandLong& command, uint8_t stream_id)
 {
-    auto stream_id = static_cast<uint8_t>(command.params.param1);
-
-    UNUSED(stream_id);
+    LogWarn() << "Camera video stream status request for ID " << stream_id;
 
     if (!_is_video_stream_info_set) {
         return _server_component_impl->make_command_ack_message(
             command, MAV_RESULT::MAV_RESULT_UNSUPPORTED);
     }
-
     auto command_ack =
         _server_component_impl->make_command_ack_message(command, MAV_RESULT::MAV_RESULT_ACCEPTED);
     _server_component_impl->send_command_ack(command_ack);
